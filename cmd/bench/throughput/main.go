@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,7 +38,7 @@ type Metrics struct {
 }
 
 func main() {
-	alog.Output = os.DevNull
+	alog.SetLevel(alog.LevelNone)
 
 	cfg := parseFlags()
 
