@@ -28,7 +28,7 @@ trap cleanup EXIT INT TERM
 if [ ! -f "./server" ] || [ ! -f "./benchmark" ]; then
     echo "Building executables..."
     go build -o server ./cmd/server
-    go build -o benchmark ./cmd/benchmark/throughput
+    go build -o benchmark ./cmd/bench/throughput
 fi
 
 # Create data directories and start servers
