@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"path/filepath"
 	"sync"
 	"time"
@@ -11,8 +12,9 @@ import (
 	"github.com/buraksezer/consistent"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb"
+	"github.com/rs/zerolog"
 
-	"github.com/DeltaLaboratory/dkv/internal/storage"
+	"github.com/DeltaLaboratory/shard/internal/storage"
 )
 
 const (
@@ -30,15 +32,18 @@ type Manager struct {
 	clients      *ClientPool
 	migrationMgr *MigrationManager
 	store        *storage.PebbleStore
+
+	logger zerolog.Logger
 }
 
-func NewManager(nodeID, address string, store *storage.PebbleStore, dataDir string) (*Manager, error) {
+func NewManager(nodeID, address string, store *storage.PebbleStore, dataDir string, logger zerolog.Logger) (*Manager, error) {
 	m := &Manager{
 		nodeID:  nodeID,
 		address: address,
 		state:   &State{Nodes: make(map[string]*Node)},
 		clients: NewClientPool(),
 		store:   store,
+		logger:  logger.With().Str("layer", "cluster").Logger(),
 	}
 
 	// Configure consistent hashing
@@ -53,6 +58,7 @@ func NewManager(nodeID, address string, store *storage.PebbleStore, dataDir stri
 	// Initialize Raft
 	raftConfig := raft.DefaultConfig()
 	raftConfig.LocalID = raft.ServerID(nodeID)
+	raftConfig.Logger = NewHclogAdapter(logger)
 
 	// Configure Raft storage
 	logStore, err := raftboltdb.NewBoltStore(filepath.Join(dataDir, "raft-log.db"))
@@ -70,8 +76,13 @@ func NewManager(nodeID, address string, store *storage.PebbleStore, dataDir stri
 		return nil, err
 	}
 
+	ipAddr, err := net.ResolveTCPAddr("tcp", address)
+	if err != nil {
+		return nil, err
+	}
+
 	// Create transport
-	transport, err := raft.NewTCPTransport(address, nil, 3, 10*time.Second, nil)
+	transport, err := raft.NewTCPTransport(address, ipAddr, 3, 10*time.Second, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -134,28 +145,56 @@ func (m *Manager) Bootstrap() error {
 }
 
 // Join adds a new node to the cluster
-func (m *Manager) Join(nodeID, address string) error {
+func (m *Manager) Join(nodeID, raftAddress, rpcAddress string) error {
 	if m.Raft.State() != raft.Leader {
 		return fmt.Errorf("not the leader")
 	}
 
+	m.logger.Info().Str("node_id", nodeID).Str("raft_address", raftAddress).Str("rpc_address", rpcAddress).Msg("Joining cluster")
+
+	futureConfig := m.Raft.GetConfiguration()
+	if err := futureConfig.Error(); err != nil {
+		return fmt.Errorf("failed to get raft configuration: %v", err)
+	}
+
+	for _, server := range futureConfig.Configuration().Servers {
+		if server.ID == raft.ServerID(nodeID) {
+			m.logger.Info().Str("node_id", nodeID).Msg("Node already exists in the cluster")
+			return nil
+		}
+	}
+
 	// Step 1: Add node in JOINING state
 	newNode := &Node{
-		ID:      nodeID,
-		Address: address,
-		State:   NodeStateJoining,
-		HashKey: Hasher{}.Sum64([]byte(nodeID)),
+		ID:          nodeID,
+		RaftAddress: raftAddress,
+		RPCAddress:  rpcAddress,
+		State:       NodeStateJoining,
+		HashKey:     Hasher{}.Sum64([]byte(nodeID)),
 	}
 
 	// Verify connection to the new node
-	_, err := m.clients.GetClient(nodeID, address)
+	_, err := m.clients.GetClient(nodeID, rpcAddress)
 	if err != nil {
 		return fmt.Errorf("failed to connect to new node: %v", err)
 	}
 
+	m.logger.Info().Str("node_id", nodeID).Str("raft_address", raftAddress).Str("rpc_address", rpcAddress).Msg("Connected to new node")
+
+	m.logger.Info().Str("node_id", nodeID).Msg("Adding node to raft")
+	// Add node to raft
+	f := m.Raft.AddVoter(raft.ServerID(nodeID), raft.ServerAddress(raftAddress), 0, 0)
+	if err := f.Error(); err != nil {
+		m.clients.RemoveClient(nodeID)
+		return fmt.Errorf("failed to add node to raft: %v", err)
+	}
+	m.logger.Info().Str("node_id", nodeID).Msg("Added node to raft")
+
+	m.logger.Info().Str("node_id", nodeID).Msg("Creating migration plan")
+
 	// Step 2: Create and apply migration plan
 	oldRing := m.ring
-	newNodes := append(m.GetActiveNodes(), newNode)
+	newNodes := append(m.GetActiveNodes(false), newNode)
 	newRing := m.createNewRing(newNodes)
 
 	plan, err := m.CreateMigrationPlan(oldRing, newRing)
@@ -163,6 +202,8 @@ func (m *Manager) Join(nodeID, address string) error {
 		m.clients.RemoveClient(nodeID)
 		return fmt.Errorf("failed to create migration plan: %v", err)
 	}
+
+	m.logger.Info().Str("node_id", nodeID).Msg("Created migration plan")
 
 	// Step 3: Apply node addition and migration plan through Raft
 	cmd := &Command{
@@ -183,6 +224,8 @@ func (m *Manager) Join(nodeID, address string) error {
 		return fmt.Errorf("failed to apply join command: %v", err)
 	}
 
+	m.logger.Info().Str("node_id", nodeID).Msg("Applied join command")
+
 	// Step 4: Execute migrations
 	ctx, cancel := context.WithTimeout(context.Background(), joinTimeout)
 	defer cancel()
@@ -199,6 +242,8 @@ func (m *Manager) Join(nodeID, address string) error {
 		return fmt.Errorf("migration failed: %v", err)
 	}
 
+	m.logger.Info().Str("node_id", nodeID).Msg("Executed migrations")
+
 	// Step 5: Update node state to ACTIVE
 	updateCmd := &Command{
 		Op: CommandUpdateNodeState,
@@ -212,6 +257,8 @@ func (m *Manager) Join(nodeID, address string) error {
 	if err := m.Raft.Apply(updateData, defaultTimeout).Error(); err != nil {
 		return fmt.Errorf("failed to activate node: %v", err)
 	}
+
+	m.logger.Info().Str("node_id", nodeID).Msg("Activated node")
 
 	return nil
 }
@@ -239,7 +286,7 @@ func (m *Manager) Leave(nodeID string) error {
 	// Step 2: Create migration plan
 	oldRing := m.ring
 	newNodes := make([]*Node, 0)
-	for _, node := range m.GetActiveNodes() {
+	for _, node := range m.GetActiveNodes(false) {
 		if node.ID != nodeID {
 			newNodes = append(newNodes, node)
 		}
@@ -349,10 +396,25 @@ func (m *Manager) createNewRing(nodes []*Node) *consistent.Consistent {
 	return ring
 }
 
-// Get list of active nodes
-func (m *Manager) GetActiveNodes() []*Node {
+func (m *Manager) GetNodeByID(nodeID string) (*Node, error) {
 	m.stateLock.RLock()
 	defer m.stateLock.RUnlock()
+
+	node, exists := m.state.Nodes[nodeID]
+	if !exists {
+		return nil, fmt.Errorf("node not found")
+	}
+
+	return node, nil
+}
+
+func (m *Manager) GetActiveNodes(noLock bool) []*Node {
+	m.logger.Debug().Msg("GetActiveNodes")
+
+	if !noLock {
+		m.stateLock.RLock()
+		defer m.stateLock.RUnlock()
+	}
 
 	var activeNodes []*Node
 	for _, node := range m.state.Nodes {
@@ -360,6 +422,8 @@ func (m *Manager) GetActiveNodes() []*Node {
 			activeNodes = append(activeNodes, node)
 		}
 	}
+
+	m.logger.Debug().Msg("GetActiveNodes: done")
 	return activeNodes
 }
 

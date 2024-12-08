@@ -2,72 +2,166 @@ package server
 
 import (
 	"fmt"
+	"net"
 	"path/filepath"
+	"time"
 
 	"github.com/hashicorp/raft"
 	"github.com/lesismal/arpc"
 	"github.com/rs/zerolog"
 
-	"github.com/DeltaLaboratory/dkv/internal/cluster"
-	"github.com/DeltaLaboratory/dkv/internal/protocol"
-	"github.com/DeltaLaboratory/dkv/internal/storage"
+	"github.com/DeltaLaboratory/shard/internal/cluster"
+	"github.com/DeltaLaboratory/shard/internal/protocol"
+	"github.com/DeltaLaboratory/shard/internal/storage"
 )
 
 type Server struct {
-	handler *Handler
-	server  *arpc.Server
-	cluster *cluster.Manager
+	nodeID     string
+	raftAddr   string
+	serverAddr string
+	dataDir    string
+	store      *storage.PebbleStore
+	cluster    *cluster.Manager
+	rpcServer  *arpc.Server
+	handler    *Handler
 
 	logger zerolog.Logger
 }
 
-func NewServer(nodeID, address, dataPath string, logger zerolog.Logger) (*Server, error) {
-	store, err := storage.NewPebbleStore(filepath.Join(dataPath, "store"), logger)
+func NewServer(nodeID, raftAddr, serverAddr, dataDir string, logger zerolog.Logger) (*Server, error) {
+	storePath := filepath.Join(dataDir, "store")
+	store, err := storage.NewPebbleStore(storePath, logger)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create storage: %w", err)
+		return nil, fmt.Errorf("failed to create store: %v", err)
 	}
+
+	// Initialize cluster manager
+	clusterMgr, err := cluster.NewManager(
+		nodeID,
+		raftAddr,
+		store,
+		filepath.Join(dataDir, "raft"),
+		logger,
+	)
+	if err != nil {
+		store.Close()
+		return nil, fmt.Errorf("failed to create cluster manager: %v", err)
+	}
+
+	// Create RPC server
+	rpcServer := arpc.NewServer()
 
 	handler, err := NewHandler(store)
 	if err != nil {
-		return nil, err
-	}
-
-	server := arpc.NewServer()
-
-	clusterManager, err := cluster.NewManager(nodeID, address, store, filepath.Join(dataPath, "raft"))
-	if err != nil {
-		return nil, err
+		if err := store.Close(); err != nil {
+			logger.Error().Err(err).Msg("failed to close store")
+		}
+		if err := clusterMgr.Close(); err != nil {
+			logger.Error().Err(err).Msg("failed to close cluster manager")
+		}
+		return nil, fmt.Errorf("failed to create handler: %v", err)
 	}
 
 	s := &Server{
-		handler: handler,
-		server:  server,
-		logger:  logger,
-		cluster: clusterManager,
+		nodeID:     nodeID,
+		raftAddr:   raftAddr,
+		serverAddr: serverAddr,
+		dataDir:    dataDir,
+		store:      store,
+		cluster:    clusterMgr,
+		rpcServer:  rpcServer,
+		handler:    handler,
+
+		logger: logger,
 	}
 
 	// Register RPC methods
-	server.Handler.Handle("/kv/get", s.handleGet)
-	server.Handler.Handle("/kv/set", s.handleSet)
-	server.Handler.Handle("/kv/delete", s.handleDelete)
-	server.Handler.Handle("/kv/redirect", s.handleRedirect)
-	server.Handler.Handle("/cluster/join", s.handleJoin)
-	server.Handler.Handle("/cluster/leave", s.handleLeave)
-	server.Handler.Handle("/cluster/leader", s.handleClusterLeader)
-	server.Handler.Handle("/cluster/info", s.handleClusterInfo)
+	rpcServer.Handler.Handle("/kv/get", s.handleGet)
+	rpcServer.Handler.Handle("/kv/set", s.handleSet)
+	rpcServer.Handler.Handle("/kv/delete", s.handleDelete)
+	rpcServer.Handler.Handle("/kv/redirect", s.handleRedirect)
+	rpcServer.Handler.Handle("/cluster/join", s.handleJoin)
+	rpcServer.Handler.Handle("/cluster/leave", s.handleLeave)
+	rpcServer.Handler.Handle("/cluster/leader", s.handleClusterLeader)
+	rpcServer.Handler.Handle("/cluster/info", s.handleClusterInfo)
 
 	return s, nil
 }
 
-func (s *Server) Start(addr string) error {
-	return s.server.Run(addr)
+func (s *Server) Cluster() *cluster.Manager {
+	return s.cluster
+}
+
+func (s *Server) Start() error {
+	// Start RPC server
+	if err := s.rpcServer.Run(s.serverAddr); err != nil {
+		return fmt.Errorf("failed to start RPC server: %v", err)
+	}
+
+	return nil
+}
+
+func (s *Server) Bootstrap() error {
+	return s.cluster.Bootstrap()
+}
+
+func (s *Server) Join(joinAddr string) error {
+	// Create temporary client to join cluster
+	client, err := arpc.NewClient(func() (net.Conn, error) {
+		return net.Dial("tcp", joinAddr)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to connect to cluster: %v", err)
+	}
+	defer client.Stop()
+
+	// Send join request
+	req := &protocol.ServerInfo{
+		ID:          s.nodeID,
+		RaftAddress: s.raftAddr,
+		RPCAddress:  s.serverAddr,
+	}
+
+	if err := client.Call("/cluster/join", req, &struct{}{}, time.Minute); err != nil {
+		return fmt.Errorf("failed to join cluster: %v", err)
+	}
+
+	return nil
+}
+
+func (s *Server) Stop() error {
+	// Stop RPC server
+	if err := s.rpcServer.Stop(); err != nil {
+		s.logger.Error().Err(err).Msg("failed to stop RPC server")
+	}
+
+	// Stop cluster manager
+	if err := s.cluster.Close(); err != nil {
+		s.logger.Error().Err(err).Msg("failed to close cluster manager")
+	}
+
+	// Close storage
+	if err := s.store.Close(); err != nil {
+		s.logger.Error().Err(err).Msg("failed to close storage")
+	}
+
+	return nil
 }
 
 func (s *Server) handleClusterLeader(ctx *arpc.Context) {
-	addr, id := s.cluster.Raft.LeaderWithID()
+	_, id := s.cluster.Raft.LeaderWithID()
+	node, err := s.cluster.GetNodeByID(string(id))
+	if err != nil {
+		if err := ctx.Error(fmt.Errorf("failed to retrieve leader node")); err != nil {
+			s.logger.Error().Err(err).Str("handler", "cluster/leader").Msg("failed to send error response")
+		}
+		return
+	}
+
 	if err := ctx.Write(&protocol.ServerInfo{
-		ID:      string(id),
-		Address: string(addr),
+		ID:          string(id),
+		RaftAddress: node.RaftAddress,
+		RPCAddress:  node.RPCAddress,
 	}); err != nil {
 		s.logger.Error().Err(err).Str("handler", "cluster/leader").Msg("failed to write response")
 	}
@@ -84,13 +178,14 @@ func (s *Server) handleClusterInfo(ctx *arpc.Context) {
 		return
 	}
 
-	nodes := s.cluster.GetActiveNodes()
+	nodes := s.cluster.GetActiveNodes(false)
 	servers := make([]protocol.ServerInfo, len(nodes))
 
 	for i, node := range nodes {
 		servers[i] = protocol.ServerInfo{
-			ID:      node.ID,
-			Address: node.Address,
+			ID:          node.ID,
+			RaftAddress: node.RaftAddress,
+			RPCAddress:  node.RPCAddress,
 		}
 	}
 
@@ -130,7 +225,7 @@ func (s *Server) handleGet(ctx *arpc.Context) {
 		}
 
 		if err := ctx.Write(&protocol.KVResponse{
-			RedirectTo: node.Address,
+			RedirectTo: node.RPCAddress,
 		}); err != nil {
 			s.logger.Error().Err(err).Str("handler", "kv/get").Msg("failed to write response")
 		}
@@ -179,7 +274,7 @@ func (s *Server) handleSet(ctx *arpc.Context) {
 		}
 
 		if err := ctx.Write(&protocol.KVResponse{
-			RedirectTo: node.Address,
+			RedirectTo: node.RPCAddress,
 		}); err != nil {
 			s.logger.Error().Err(err).Str("handler", "kv/set").Msg("failed to write response")
 		}
@@ -226,7 +321,7 @@ func (s *Server) handleDelete(ctx *arpc.Context) {
 		}
 
 		if err := ctx.Write(&protocol.KVResponse{
-			RedirectTo: node.Address,
+			RedirectTo: node.RPCAddress,
 		}); err != nil {
 			s.logger.Error().Err(err).Str("handler", "kv/delete").Msg("failed to write response")
 		}
@@ -313,10 +408,7 @@ func (s *Server) handleRedirect(ctx *arpc.Context) {
 }
 
 func (s *Server) handleJoin(ctx *arpc.Context) {
-	var req struct {
-		NodeID  string
-		Address string
-	}
+	var req protocol.ServerInfo
 	if err := ctx.Bind(&req); err != nil {
 		if err := ctx.Error(err); err != nil {
 			s.logger.Error().Err(err).Str("handler", "cluster/join").Msg("failed to send error response")
@@ -324,7 +416,7 @@ func (s *Server) handleJoin(ctx *arpc.Context) {
 		return
 	}
 
-	err := s.cluster.Join(req.NodeID, req.Address)
+	err := s.cluster.Join(req.ID, req.RaftAddress, req.RPCAddress)
 	if err != nil {
 		if err := ctx.Error(err); err != nil {
 			s.logger.Error().Err(err).Str("handler", "cluster/join").Msg("failed to send error response")
@@ -338,9 +430,7 @@ func (s *Server) handleJoin(ctx *arpc.Context) {
 }
 
 func (s *Server) handleLeave(ctx *arpc.Context) {
-	var req struct {
-		NodeID string
-	}
+	var req protocol.ServerInfo
 	if err := ctx.Bind(&req); err != nil {
 		if err := ctx.Error(err); err != nil {
 			s.logger.Error().Err(err).Str("handler", "cluster/leave").Msg("failed to send error response")
@@ -348,7 +438,7 @@ func (s *Server) handleLeave(ctx *arpc.Context) {
 		return
 	}
 
-	err := s.cluster.Leave(req.NodeID)
+	err := s.cluster.Leave(req.ID)
 	if err != nil {
 		if err := ctx.Error(err); err != nil {
 			s.logger.Error().Err(err).Str("handler", "cluster/leave").Msg("failed to send error response")

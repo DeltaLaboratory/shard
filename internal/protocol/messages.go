@@ -21,8 +21,9 @@ type KVResponse struct {
 }
 
 type ServerInfo struct {
-	ID      string `json:"id"`
-	Address string `json:"address"`
+	ID          string `json:"id"`
+	RaftAddress string `json:"raft_address"`
+	RPCAddress  string `json:"rpc_address"`
 }
 
 type ClusterInfoResponse struct {

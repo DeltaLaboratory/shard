@@ -17,10 +17,11 @@ const (
 )
 
 type Node struct {
-	ID      string    `json:"id"`
-	Address string    `json:"address"`
-	State   NodeState `json:"state"`
-	HashKey uint64    `json:"hash_key"`
+	ID          string    `json:"id"`
+	RaftAddress string    `json:"raft_address"`
+	RPCAddress  string    `json:"rpc_address"`
+	State       NodeState `json:"state"`
+	HashKey     uint64    `json:"hash_key"`
 }
 
 func (n *Node) String() string {

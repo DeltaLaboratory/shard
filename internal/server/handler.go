@@ -3,8 +3,8 @@ package server
 import (
 	"context"
 
-	"github.com/DeltaLaboratory/dkv/internal/protocol"
-	"github.com/DeltaLaboratory/dkv/internal/storage"
+	"github.com/DeltaLaboratory/shard/internal/protocol"
+	"github.com/DeltaLaboratory/shard/internal/storage"
 )
 
 type Handler struct {

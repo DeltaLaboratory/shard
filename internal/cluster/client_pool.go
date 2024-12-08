@@ -9,7 +9,7 @@ import (
 
 	"github.com/lesismal/arpc"
 
-	"github.com/DeltaLaboratory/dkv/internal/protocol"
+	"github.com/DeltaLaboratory/shard/internal/protocol"
 )
 
 type ClientPool struct {

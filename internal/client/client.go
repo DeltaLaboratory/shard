@@ -11,7 +11,7 @@ import (
 	"github.com/lesismal/arpc"
 	"github.com/rs/zerolog"
 
-	"github.com/DeltaLaboratory/dkv/internal/protocol"
+	"github.com/DeltaLaboratory/shard/internal/protocol"
 )
 
 type Client struct {
@@ -43,6 +43,7 @@ func NewClient(bootStrapAddr string, logger ...zerolog.Logger) (*Client, error) 
 		clients:      make(map[string]*arpc.Client),
 		leaderClient: bootStrapClient,
 		leaderAddr:   bootStrapAddr,
+		timeout:      5 * time.Second,
 	}
 
 	if len(logger) > 0 {
@@ -213,11 +214,11 @@ func (c *Client) updateLeaderConnection() error {
 		return fmt.Errorf("failed to get leader info: %v", err)
 	}
 
-	if resp.Address == "" {
+	if resp.RaftAddress == "" {
 		return fmt.Errorf("no leader available")
 	}
 
-	if c.leaderAddr == resp.Address {
+	if c.leaderAddr == resp.RPCAddress {
 		return nil
 	}
 
@@ -228,7 +229,7 @@ func (c *Client) updateLeaderConnection() error {
 
 	if !exists {
 		client, err = arpc.NewClient(func() (net.Conn, error) {
-			return net.Dial("tcp", resp.Address)
+			return net.Dial("tcp", resp.RPCAddress)
 		})
 		if err != nil {
 			return err
@@ -239,7 +240,7 @@ func (c *Client) updateLeaderConnection() error {
 	c.clients[resp.ID] = client
 	c.clientsLock.Unlock()
 
-	c.leaderAddr = resp.Address
+	c.leaderAddr = resp.RPCAddress
 	c.leaderClient = client
 
 	return nil
@@ -271,8 +272,9 @@ func (c *Client) updateClusterInfo() error {
 
 	for _, server := range resp.Servers {
 		newRing.Add(&ServerNode{
-			ID:      server.ID,
-			Address: server.Address,
+			ID:          server.ID,
+			RaftAddress: server.RaftAddress,
+			RPCAddress:  server.RPCAddress,
 		})
 
 		// Reuse existing connection or create new one
@@ -282,7 +284,7 @@ func (c *Client) updateClusterInfo() error {
 
 		if !exists {
 			client, err = arpc.NewClient(func() (net.Conn, error) {
-				return net.Dial("tcp", server.Address)
+				return net.Dial("tcp", server.RPCAddress)
 			})
 			if err != nil {
 				continue // Skip failed connections
@@ -369,8 +371,9 @@ func (c *Client) Close() error {
 }
 
 type ServerNode struct {
-	ID      string
-	Address string
+	ID          string
+	RaftAddress string
+	RPCAddress  string
 }
 
 func (n *ServerNode) String() string {

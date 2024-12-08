@@ -8,7 +8,7 @@ import (
 
 	"github.com/buraksezer/consistent"
 
-	"github.com/DeltaLaboratory/dkv/internal/storage"
+	"github.com/DeltaLaboratory/shard/internal/storage"
 )
 
 const (
@@ -172,7 +172,7 @@ func (mm *MigrationManager) updateTaskProgress(ctx context.Context, task *Migrat
 
 func (mm *MigrationManager) transferBatch(ctx context.Context, nodeID string, batch map[string][]byte) error {
 	// Get client from pool
-	pc, err := mm.manager.clients.GetClient(nodeID, mm.manager.state.Nodes[nodeID].Address)
+	pc, err := mm.manager.clients.GetClient(nodeID, mm.manager.state.Nodes[nodeID].RPCAddress)
 	if err != nil {
 		return fmt.Errorf("failed to get client: %v", err)
 	}

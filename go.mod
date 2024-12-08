@@ -1,4 +1,4 @@
-module github.com/DeltaLaboratory/dkv
+module github.com/DeltaLaboratory/shard
 
 go 1.23.1
 
@@ -6,6 +6,7 @@ require (
 	github.com/buraksezer/consistent v0.10.0
 	github.com/cockroachdb/pebble v1.1.2
 	github.com/hashicorp/raft v1.7.1
+	github.com/hashicorp/raft-boltdb v0.0.0-20241202213821-f9dd2ba30efd
 	github.com/lesismal/arpc v1.2.16
 	github.com/rs/zerolog v1.33.0
 )
@@ -31,7 +32,6 @@ require (
 	github.com/hashicorp/go-msgpack v0.5.5 // indirect
 	github.com/hashicorp/go-msgpack/v2 v2.1.2 // indirect
 	github.com/hashicorp/golang-lru v0.5.1 // indirect
-	github.com/hashicorp/raft-boltdb v0.0.0-20241202213821-f9dd2ba30efd // indirect
 	github.com/klauspost/compress v1.16.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
