@@ -16,11 +16,13 @@ const (
 	CommandUpdateNodeState
 	CommandRemoveNode
 	CommandUpdateMigrationTask
+	CommandSyncNode
 )
 
 type Command struct {
 	Op            CommandType    `json:"op"`
 	Node          *Node          `json:"node,omitempty"`
+	Nodes         []*Node        `json:"nodes,omitempty"`
 	MigrationPlan *MigrationPlan `json:"migration_plan,omitempty"`
 	MigrationTask *MigrationTask `json:"migration_task,omitempty"`
 }
@@ -79,10 +81,46 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 		result := f.applyUpdateMigrationTask(cmd)
 		f.manager.logger.Debug().Interface("result", result).Msg("UpdateMigrationTask command completed")
 		return result
+	case CommandSyncNode:
+		f.manager.logger.Debug().Msg("Executing SyncNode command")
+		result := f.applySyncNode(cmd)
+		f.manager.logger.Debug().Interface("result", result).Msg("SyncNode command completed")
+		return result
 	default:
 		f.manager.logger.Error().Interface("command_type", cmd.Op).Msg("Unknown command type")
 		return fmt.Errorf("unknown command type: %v", cmd.Op)
 	}
+}
+
+func (f *FSM) applySyncNode(cmd Command) interface{} {
+	f.manager.logger.Debug().Msg("Starting applySyncNode")
+
+	if cmd.Nodes == nil {
+		f.manager.logger.Error().Msg("Node data is missing in SyncNode command")
+		return fmt.Errorf("node data is missing")
+	}
+
+	f.manager.logger.Debug().
+		Interface("nodes", cmd.Nodes).
+		Msg("Syncing nodes with leader")
+
+	f.manager.state.Nodes = make(map[string]*Node)
+	for _, node := range cmd.Nodes {
+		f.manager.state.Nodes[node.ID] = node
+	}
+
+	if len(cmd.Nodes) > 0 {
+		nodes := f.manager.GetActiveNodes(true)
+		f.manager.logger.Debug().
+			Interface("active_nodes", nodes).
+			Msg("Updating ring after node sync")
+
+		f.manager.ring = f.manager.createNewRing(nodes)
+	}
+
+	f.manager.logger.Debug().Any("nodes", f.manager.state.Nodes).Msg("SyncNode command completed")
+
+	return nil
 }
 
 func (f *FSM) applyJoinNode(cmd Command) interface{} {

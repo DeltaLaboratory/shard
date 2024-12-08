@@ -35,7 +35,7 @@ func (p *ClientPool) GetClient(nodeID, address string) (*PooledClient, error) {
 	p.mu.RUnlock()
 
 	if exists {
-		// Check if address changed
+		// Check if raftAddress changed
 		if pc.address != address {
 			p.mu.Lock()
 			// Double check after acquiring write lock

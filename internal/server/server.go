@@ -39,6 +39,7 @@ func NewServer(nodeID, raftAddr, serverAddr, dataDir string, logger zerolog.Logg
 	clusterMgr, err := cluster.NewManager(
 		nodeID,
 		raftAddr,
+		serverAddr,
 		store,
 		filepath.Join(dataDir, "raft"),
 		logger,
@@ -126,16 +127,58 @@ func (s *Server) Join(joinAddr string) error {
 		return fmt.Errorf("failed to join cluster: %v", err)
 	}
 
+	s.logger.Info().Any("nodes", s.cluster.GetActiveNodes(false)).Msg("joined cluster")
+
+	return nil
+}
+
+func (s *Server) Leave() error {
+	s.logger.Info().Msg("leaving cluster")
+
+	leader, err := s.cluster.GetLeader()
+	if err != nil {
+		return fmt.Errorf("failed to get leader: %v", err)
+	}
+
+	s.logger.Info().Str("leader", leader).Msg("found leader")
+
+	node, err := s.cluster.GetNodeByID(leader)
+	if err != nil {
+		return fmt.Errorf("failed to get leader node: %v", err)
+	}
+
+	// Create temporary client to leave cluster
+	client, err := arpc.NewClient(func() (net.Conn, error) {
+		return net.Dial("tcp", node.RPCAddress)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to connect to cluster: %v", err)
+	}
+	defer client.Stop()
+
+	// Send leave request
+	req := &protocol.ServerInfo{
+		ID:          s.nodeID,
+		RaftAddress: s.raftAddr,
+		RPCAddress:  s.serverAddr,
+	}
+
+	if err := client.Call("/cluster/leave", req, &struct{}{}, time.Minute); err != nil {
+		return fmt.Errorf("failed to leave cluster: %v", err)
+	}
+
 	return nil
 }
 
 func (s *Server) Stop() error {
-	// Stop RPC server
+	if err := s.Leave(); err != nil {
+		s.logger.Error().Err(err).Msg("failed to leave cluster")
+	}
+
 	if err := s.rpcServer.Stop(); err != nil {
 		s.logger.Error().Err(err).Msg("failed to stop RPC server")
 	}
 
-	// Stop cluster manager
 	if err := s.cluster.Close(); err != nil {
 		s.logger.Error().Err(err).Msg("failed to close cluster manager")
 	}

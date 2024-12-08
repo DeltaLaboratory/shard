@@ -24,7 +24,8 @@ const (
 
 type Manager struct {
 	nodeID       string
-	address      string
+	raftAddress  string
+	rpcAddress   string
 	Raft         *raft.Raft
 	state        *State
 	ring         *consistent.Consistent
@@ -36,14 +37,15 @@ type Manager struct {
 	logger zerolog.Logger
 }
 
-func NewManager(nodeID, address string, store *storage.PebbleStore, dataDir string, logger zerolog.Logger) (*Manager, error) {
+func NewManager(nodeID, raftAddress, rpcAddress string, store *storage.PebbleStore, dataDir string, logger zerolog.Logger) (*Manager, error) {
 	m := &Manager{
-		nodeID:  nodeID,
-		address: address,
-		state:   &State{Nodes: make(map[string]*Node)},
-		clients: NewClientPool(),
-		store:   store,
-		logger:  logger.With().Str("layer", "cluster").Logger(),
+		nodeID:      nodeID,
+		raftAddress: raftAddress,
+		rpcAddress:  rpcAddress,
+		state:       &State{Nodes: make(map[string]*Node)},
+		clients:     NewClientPool(),
+		store:       store,
+		logger:      logger.With().Str("layer", "cluster").Logger(),
 	}
 
 	// Configure consistent hashing
@@ -76,13 +78,13 @@ func NewManager(nodeID, address string, store *storage.PebbleStore, dataDir stri
 		return nil, err
 	}
 
-	ipAddr, err := net.ResolveTCPAddr("tcp", address)
+	ipAddr, err := net.ResolveTCPAddr("tcp", raftAddress)
 	if err != nil {
 		return nil, err
 	}
 
 	// Create transport
-	transport, err := raft.NewTCPTransport(address, ipAddr, 3, 10*time.Second, logger)
+	transport, err := raft.NewTCPTransport(raftAddress, ipAddr, 3, 10*time.Second, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -137,11 +139,25 @@ func (m *Manager) Bootstrap() error {
 		Servers: []raft.Server{
 			{
 				ID:      raft.ServerID(m.nodeID),
-				Address: raft.ServerAddress(m.address),
+				Address: raft.ServerAddress(m.raftAddress),
 			},
 		},
 	}
-	return m.Raft.BootstrapCluster(configuration).Error()
+	if err := m.Raft.BootstrapCluster(configuration).Error(); err != nil {
+		return fmt.Errorf("failed to bootstrap cluster: %v", err)
+	} else {
+		m.UpdateState(&State{
+			Nodes: map[string]*Node{
+				m.nodeID: {
+					ID:          m.nodeID,
+					RaftAddress: m.raftAddress,
+					RPCAddress:  m.rpcAddress,
+				},
+			},
+		})
+	}
+
+	return nil
 }
 
 // Join adds a new node to the cluster
@@ -190,6 +206,23 @@ func (m *Manager) Join(nodeID, raftAddress, rpcAddress string) error {
 	}
 	m.logger.Info().Str("node_id", nodeID).Msg("Added node to raft")
 
+	// Sync state to new node
+	cmd := &Command{
+		Op:    CommandSyncNode,
+		Nodes: m.GetActiveNodes(false),
+	}
+
+	data, err := json.Marshal(cmd)
+	if err != nil {
+		m.clients.RemoveClient(nodeID)
+		return fmt.Errorf("failed to marshal sync command: %w", err)
+	}
+
+	if err := m.Raft.Apply(data, defaultTimeout).Error(); err != nil {
+		m.clients.RemoveClient(nodeID)
+		return fmt.Errorf("failed to apply sync command: %w", err)
+	}
+
 	m.logger.Info().Str("node_id", nodeID).Msg("Creating migration plan")
 
 	// Step 2: Create and apply migration plan
@@ -206,13 +239,13 @@ func (m *Manager) Join(nodeID, raftAddress, rpcAddress string) error {
 	m.logger.Info().Str("node_id", nodeID).Msg("Created migration plan")
 
 	// Step 3: Apply node addition and migration plan through Raft
-	cmd := &Command{
+	cmd = &Command{
 		Op:            CommandJoinNode,
 		Node:          newNode,
 		MigrationPlan: plan,
 	}
 
-	data, err := json.Marshal(cmd)
+	data, err = json.Marshal(cmd)
 	if err != nil {
 		m.clients.RemoveClient(nodeID)
 		return fmt.Errorf("failed to marshal join command: %v", err)
@@ -259,6 +292,22 @@ func (m *Manager) Join(nodeID, raftAddress, rpcAddress string) error {
 	}
 
 	m.logger.Info().Str("node_id", nodeID).Msg("Activated node")
+
+	// update all known nodes to update their ring
+	for _, node := range m.GetActiveNodes(false) {
+		updateCmd := &Command{
+			Op: CommandUpdateNodeState,
+			Node: &Node{
+				ID:    node.ID,
+				State: NodeStateActive,
+			},
+		}
+
+		updateData, _ := json.Marshal(updateCmd)
+		if err := m.Raft.Apply(updateData, defaultTimeout).Error(); err != nil {
+			return fmt.Errorf("failed to activate node: %v", err)
+		}
+	}
 
 	return nil
 }
@@ -331,6 +380,11 @@ func (m *Manager) Leave(nodeID string) error {
 	removeData, _ := json.Marshal(removeCmd)
 	if err := m.Raft.Apply(removeData, defaultTimeout).Error(); err != nil {
 		return fmt.Errorf("failed to remove node: %v", err)
+	}
+
+	f := m.Raft.RemoveServer(raft.ServerID(nodeID), 0, 0)
+	if err := f.Error(); err != nil {
+		return fmt.Errorf("failed to remove node from raft: %v", err)
 	}
 
 	// Clean up client connection
