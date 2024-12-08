@@ -77,7 +77,7 @@ echo "Starting benchmarks..."
 echo "Running write-heavy benchmark..."
 ./benchmark -addr "localhost:$BASE_SERVER_PORT" \
     -n 100000 \
-    -c 100 \
+    -c 32 \
     -size 1024 \
     -write-ratio 0.8 \
     -duration "$BENCH_DURATION"
@@ -88,7 +88,7 @@ sleep 2
 echo "Running read-heavy benchmark..."
 ./benchmark -addr "localhost:$BASE_SERVER_PORT" \
     -n 100000 \
-    -c 100 \
+    -c 32 \
     -size 1024 \
     -write-ratio 0.2 \
     -duration "$BENCH_DURATION"
@@ -99,7 +99,7 @@ sleep 2
 echo "Running high concurrency benchmark..."
 ./benchmark -addr "localhost:$BASE_SERVER_PORT" \
     -n 100000 \
-    -c 1000 \
+    -c 32 \
     -size 1024 \
     -write-ratio 0.5 \
     -duration "$BENCH_DURATION"
@@ -110,7 +110,7 @@ sleep 2
 echo "Running large values benchmark..."
 ./benchmark -addr "localhost:$BASE_SERVER_PORT" \
     -n 10000 \
-    -c 50 \
+    -c 32 \
     -size 1048576 \
     -write-ratio 0.5 \
     -duration "$BENCH_DURATION"

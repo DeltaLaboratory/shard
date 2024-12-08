@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	alog "github.com/lesismal/arpc/log"
 
 	"github.com/DeltaLaboratory/shard/internal/client"
 )
@@ -36,6 +39,8 @@ type Metrics struct {
 }
 
 func main() {
+	alog.Output = os.DevNull
+
 	cfg := parseFlags()
 
 	// Create client
