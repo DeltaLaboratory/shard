@@ -1,0 +1,10 @@
+SET:
+  SET this_is_key this_is_value
+  SET this_is_key "this is value"
+  SET this_is_key "this \"is\" value"
+
+GET:
+  GET this_is_key
+
+DELETE:
+  DELETE this_is_key
